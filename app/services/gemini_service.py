@@ -18,14 +18,28 @@ GEMINI_URL = (
 
 
 def _build_prompt(req: RecommendRequest) -> str:
+    # Escape quotes to prevent prompt injection/corruption
+    room_type = req.room_type.replace('"', '\\"')
+    style = req.style.replace('"', '\\"')
+    furniture_density = req.furniture_density.value.replace('"', '\\"')
+    gender = req.gender.value.replace('"', '\\"')
+
+    user_input = f"""Room type: {room_type}
+Desired style: {style}
+Room dimensions: {req.width}m x {req.length}m x {req.height}m
+Furniture density: {furniture_density}
+User gender: {gender}"""
+    if req.age:
+        user_input += f"\nUser age: {req.age}"
+
+    max_w = round(req.width * 100 * 0.4, 1)
+    max_d = round(req.length * 100 * 0.35, 1)
+
     return f"""You are an interior design AI assistant.
 Return ONLY a valid JSON object, no explanation, no markdown, no code fences.
 
 USER INPUT:
-Room type: {req.room_type}
-Desired style: {req.style}
-Room dimensions: {req.width}m x {req.length}m x {req.height}m
-Furniture density: {req.furniture_density.value}
+{user_input}
 
 Return this exact JSON structure:
 {{
@@ -41,9 +55,9 @@ Return this exact JSON structure:
     "colorHexRange": ["#hex1", "#hex2"],
     "colorTone": "warm",
     "categories": ["Sofa", "Ban", "Ghe"],
-    "maxProductWidth": {round(req.width * 100 * 0.4, 1)},
-    "maxProductDepth": {round(req.length * 100 * 0.35, 1)},
-    "furnitureDensityHint": "{req.furniture_density.value}"
+    "maxProductWidth": {max_w},
+    "maxProductDepth": {max_d},
+    "furnitureDensityHint": "{furniture_density}"
   }},
   "reasoning": "One sentence here"
 }}
@@ -53,8 +67,8 @@ RULES:
 - colorTone must be one of: warm, cool, neutral
 - lightingType must be one of: natural, artificial, mixed
 - furnitureDensityHint must be one of: sparse, medium, dense
-- maxProductWidth = {round(req.width * 100 * 0.4, 1)}
-- maxProductDepth = {round(req.length * 100 * 0.35, 1)}
+- maxProductWidth = {max_w}
+- maxProductDepth = {max_d}
 - categories use these Vietnamese names: Sofa, Ghế, Bàn, Giường, Tủ, Kệ, Đèn
 - Return ONLY the JSON, nothing else
 """
@@ -132,7 +146,7 @@ async def analyze_room(
         "contents": [{"parts": parts}],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 4096,
             "responseMimeType": "application/json",  # ✅ ép Gemini trả JSON thuần
         },
     }

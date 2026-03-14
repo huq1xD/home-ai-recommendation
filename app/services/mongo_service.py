@@ -5,6 +5,7 @@ Hard-filter candidates from MongoDB, then rank by color distance.
 
 import os
 import math
+import re
 from typing import List, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -28,9 +29,12 @@ def get_client() -> AsyncIOMotorClient:
 # ── Color utilities ──────────────────────────────────────────────────────────
 
 def _hex_to_rgb(hex_color: str):
-    h = hex_color.lstrip("#")
-    if len(h) != 6:
+    """Converts a hex color string to an RGB tuple.
+    Returns gray for invalid formats.
+    """
+    if not isinstance(hex_color, str) or not re.match(r"^#[0-9a-fA-F]{6}$", hex_color):
         return (128, 128, 128)
+    h = hex_color.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
@@ -57,8 +61,12 @@ def _min_color_distance(product_colors: List[str], target_colors: List[str]) -> 
 
 def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
     rf = analysis.recommendedFilter
+
+    # Case-insensitive regex for styles
+    style_patterns = [re.compile(f"^{s}$", re.IGNORECASE) for s in rf.styles]
+
     query = {
-        "styles": {"$in": rf.styles},
+        "styles": {"$in": style_patterns},
         "category": {"$in": rf.categories},
         "dimensions.width": {"$lte": rf.maxProductWidth},
         "dimensions.depth": {"$lte": rf.maxProductDepth},
@@ -70,26 +78,50 @@ def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
 
 async def get_recommendations(
     analysis: GeminiAnalysisResult,
-    top_n: int = 15,
-    candidate_limit: int = 50,
+    top_n: int = 20,
+    candidate_limit: int = 70,
 ) -> tuple[List[Product], int]:
     """
     1. Hard-filter up to `candidate_limit` products from MongoDB.
-    2. Rank by color distance to recommendedFilter.colorHexRange.
+    2. Rank using a weighted score: style, color, and availability.
     3. Return top_n products + total candidates count.
     """
     db = get_client()[DB_NAME]
     col = db[COLLECTION]
 
     query = _build_mongo_query(analysis)
-    target_colors = analysis.recommendedFilter.colorHexRange
+    rf = analysis.recommendedFilter
+    target_colors = rf.colorHexRange
+    target_styles_lower = {s.lower() for s in rf.styles}
 
     cursor = col.find(query).limit(candidate_limit)
     candidates: List[Product] = []
+    max_color_dist = 441.67  # Max possible Euclidean distance in RGB
 
     async for doc in cursor:
+        prod_styles = doc.get("styles", [])
         prod_colors = doc.get("colors", [])
-        dist = _min_color_distance(prod_colors, target_colors)
+        is_in_stock = doc.get("inStock", True)  # Assume True if not present
+
+        # --- Scoring ---
+        # 1. Style Match Score (0.0 - 1.0)
+        prod_styles_lower = {s.lower() for s in prod_styles}
+        matching_styles = len(target_styles_lower.intersection(prod_styles_lower))
+        style_match_score = min(matching_styles / (len(target_styles_lower) or 1), 1.0)
+
+        # 2. Color Score (0.0 - 1.0)
+        color_dist = _min_color_distance(prod_colors, target_colors)
+        color_score = 1.0 - (color_dist / max_color_dist)
+
+        # 3. In-stock Score (0 or 1)
+        in_stock_score = 1.0 if is_in_stock else 0.0
+
+        # --- Weighted Ranking ---
+        ranking_score = (
+            (style_match_score * 0.5) +
+            (color_score * 0.3) +
+            (in_stock_score * 0.2)
+        )
 
         dim_raw = doc.get("dimensions", {})
         dims = ProductDimensions(
@@ -102,18 +134,19 @@ async def get_recommendations(
             id=str(doc.get("_id", "")),
             name=doc.get("name", ""),
             category=doc.get("category", ""),
-            styles=doc.get("styles", []),
+            styles=prod_styles,
             price=doc.get("price"),
             dimensions=dims,
             colors=prod_colors,
             imageUrl=doc.get("imageUrl"),
-            color_distance=round(dist, 2),
+            color_distance=round(color_dist, 2),
+            ranking_score=round(ranking_score, 4),
         ))
 
     total_candidates = len(candidates)
 
-    # Semantic ranking: lower distance = better color match
-    ranked = sorted(candidates, key=lambda p: p.color_distance or 999)
+    # Sort by descending ranking score
+    ranked = sorted(candidates, key=lambda p: p.ranking_score or 0, reverse=True)
     return ranked[:top_n], total_candidates
 
 
@@ -155,23 +188,42 @@ MOCK_PRODUCTS = [
 
 async def get_recommendations_mock(
     analysis: GeminiAnalysisResult,
-    top_n: int = 15,
+    top_n: int = 20,
 ) -> tuple[List[Product], int]:
-    """Mock version for development without MongoDB."""
+    """Mock version for development using the same weighted ranking."""
     rf = analysis.recommendedFilter
     target_colors = rf.colorHexRange
+    target_styles_lower = {s.lower() for s in rf.styles}
     candidates = []
+    max_color_dist = 441.67
 
     for doc in MOCK_PRODUCTS:
-        # Soft filter: check style and category overlap
-        if not any(s in rf.styles for s in doc["styles"]) and doc["category"] not in rf.categories:
+        # Hard filter mock data
+        prod_styles_lower = {s.lower() for s in doc["styles"]}
+        if not target_styles_lower.intersection(prod_styles_lower):
+            continue
+        if doc["category"] not in rf.categories:
             continue
         if doc["dimensions"]["width"] > rf.maxProductWidth:
             continue
         if doc["dimensions"]["depth"] > rf.maxProductDepth:
             continue
 
-        dist = _min_color_distance(doc["colors"], target_colors)
+        # --- Scoring ---
+        style_match_score = min(
+            len(target_styles_lower.intersection(prod_styles_lower)) /
+            (len(target_styles_lower) or 1), 1.0
+        )
+        color_dist = _min_color_distance(doc["colors"], target_colors)
+        color_score = 1.0 - (color_dist / max_color_dist)
+        in_stock_score = 1.0 if doc.get("inStock", True) else 0.0
+
+        ranking_score = (
+            (style_match_score * 0.5) +
+            (color_score * 0.3) +
+            (in_stock_score * 0.2)
+        )
+
         dims = ProductDimensions(**doc["dimensions"])
         candidates.append(Product(
             id=doc["_id"],
@@ -182,8 +234,10 @@ async def get_recommendations_mock(
             dimensions=dims,
             colors=doc["colors"],
             imageUrl=doc["imageUrl"],
-            color_distance=round(dist, 2),
+            color_distance=round(color_dist, 2),
+            ranking_score=round(ranking_score, 4),
         ))
 
-    ranked = sorted(candidates, key=lambda p: p.color_distance or 999)
+    # Sort by descending ranking score
+    ranked = sorted(candidates, key=lambda p: p.ranking_score or 0, reverse=True)
     return ranked[:top_n], len(candidates)

@@ -25,6 +25,7 @@ class RecommendRequest(BaseModel):
     height: float = Field(..., gt=0, description="Room height in meters", example=2.8)
     furniture_density: FurnitureDensity = Field(..., example="medium")
     gender: Gender = Field(..., example="female")
+    age: Optional[int] = Field(None, gt=0, description="User's age", example=25)
 
 
 # ---------- Gemini Analysis Output ----------
@@ -71,6 +72,7 @@ class Product(BaseModel):
     colors: Optional[List[str]] = []
     imageUrl: Optional[str] = None
     color_distance: Optional[float] = None  # semantic ranking score
+    ranking_score: Optional[float] = None  # weighted ranking score
 
 
 # ---------- Response ----------

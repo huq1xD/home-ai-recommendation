@@ -27,6 +27,7 @@ async def recommend_furniture(
     height: float = Form(..., example=2.8),
     furniture_density: FurnitureDensity = Form(..., example="medium"),
     gender: Gender = Form(..., example="female"),
+    age: Optional[int] = Form(None, example=25),
     image: Optional[UploadFile] = File(None),
 ):
     """
@@ -42,6 +43,7 @@ async def recommend_furniture(
         height=height,
         furniture_density=furniture_density,
         gender=gender,
+        age=age,
     )
 
     # 2. Read image bytes if provided
@@ -83,12 +85,14 @@ async def analyze_only(
     height: float = Form(...),
     furniture_density: FurnitureDensity = Form(...),
     gender: Gender = Form(...),
+    age: Optional[int] = Form(None),
     image: Optional[UploadFile] = File(None),
 ):
     """Return only Gemini analysis JSON without product lookup."""
     req = RecommendRequest(
         room_type=room_type, style=style, width=width, length=length,
         height=height, furniture_density=furniture_density, gender=gender,
+        age=age,
     )
     image_bytes = None
     image_mime = "image/jpeg"
