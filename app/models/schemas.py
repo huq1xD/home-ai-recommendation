@@ -84,6 +84,11 @@ class Product(BaseModel):
     imageUrl: Optional[str] = None
     color_distance: Optional[float] = None  # semantic ranking score
     ranking_score: Optional[float] = None  # weighted ranking score
+    style_score: Optional[float] = None
+    color_score: Optional[float] = None
+    stock_score: Optional[float] = None
+    cf_score: Optional[float] = None
+    cf_active: Optional[bool] = None
     reasoning: Optional[str] = None
 
 

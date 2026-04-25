@@ -14,7 +14,7 @@ from app.services.cf_model import get_cf_scores
 from app.models.schemas import GeminiAnalysisResult, Product, ProductDimensions
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-DB_NAME = os.getenv("MONGO_DB", "interior_db")
+DB_NAME = os.getenv("MONGO_DB", "cap2")
 COLLECTION = os.getenv("MONGO_COLLECTION", "products")
 
 _client: Optional[AsyncIOMotorClient] = None
@@ -194,6 +194,11 @@ async def get_recommendations(
             imageUrl=image_url,
             color_distance=round(data["color_dist"], 2),
             ranking_score=round(ranking_score, 4),
+            style_score=round(scores["style"], 4),
+            color_score=round(scores["color"], 4),
+            stock_score=round(scores["stock"], 4),
+            cf_score=round(cf_score, 4),
+            cf_active=bool(cf_scores),
             reasoning=reasoning,
         ))
 
