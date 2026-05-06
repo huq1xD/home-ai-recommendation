@@ -13,6 +13,21 @@ from fastapi import HTTPException
 from app.models.schemas import RecommendRequest, GeminiAnalysisResult
 from app.services.mongo_service import get_distinct_categories, get_distinct_styles
 
+
+def _normalize_gemini_response(data: dict) -> dict:
+    """
+    Normalize Gemini response to match schema enums.
+    Handles case mismatches (e.g., 'living room' → 'Living Room').
+    """
+    if "room_type" in data and isinstance(data["room_type"], str):
+        room = data["room_type"].lower().strip()
+        if "living" in room:
+            data["room_type"] = "Living Room"
+        elif "bedroom" in room or "bed room" in room:
+            data["room_type"] = "Bedroom"
+    return data
+
+
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
@@ -174,7 +189,8 @@ async def analyze_room(
                 )
 
                 if resp.status_code == 429:
-                    wait = (attempt + 1) * 10
+                    # Exponential backoff: 1s, 2s, 4s (total 7s instead of 60s)
+                    wait = 2 ** attempt
                     print(f"[Gemini] Rate limited (attempt {attempt + 1}/3), waiting {wait}s...")
                     await asyncio.sleep(wait)
                     continue
@@ -194,6 +210,7 @@ async def analyze_room(
             clean = clean.strip()
 
             parsed = json.loads(clean)
+            parsed = _normalize_gemini_response(parsed)
             print(f"[Gemini] Success on attempt {attempt + 1}")
             return GeminiAnalysisResult(**parsed)
 
