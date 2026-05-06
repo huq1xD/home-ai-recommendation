@@ -56,6 +56,8 @@ async def recommend_furniture(
     # 3. Gemini analysis
     try:
         analysis = await analyze_room(req, image_bytes, image_mime)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Image analysis failed: {exc}")
 
@@ -64,6 +66,8 @@ async def recommend_furniture(
         products, total_candidates = await get_recommendations(
             analysis, user_id=req.user_id, top_n=20
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database query failed: {exc}")
 
@@ -99,5 +103,8 @@ async def analyze_only(
         image_bytes = await image.read()
         image_mime = image.content_type or "image/jpeg"
 
-    analysis = await analyze_room(req, image_bytes, image_mime)
+    try:
+        analysis = await analyze_room(req, image_bytes, image_mime)
+    except HTTPException:
+        raise
     return analysis.dict()
