@@ -25,9 +25,9 @@ class RoomType(str, Enum):
 class RecommendRequest(BaseModel):
     room_type: RoomType = Field(..., example="Living Room")
     style: str = Field(..., example="modern")
-    width: float = Field(..., gt=0, description="Room width in meters", example=4.5)
-    length: float = Field(..., gt=0, description="Room length in meters", example=6.0)
-    height: float = Field(..., gt=0, description="Room height in meters", example=2.8)
+    width: float = Field(..., ge=2.0, le=10.0, description="Room width in meters (2-10m)", example=4.5)
+    length: float = Field(..., ge=2.0, le=12.0, description="Room length in meters (2-12m)", example=6.0)
+    height: float = Field(..., ge=2.0, le=4.0, description="Room height in meters (2-4m)", example=2.8)
     furniture_density: FurnitureDensity = Field(..., example="medium")
     gender: Gender = Field(..., example="female")
     age: Optional[int] = Field(None, gt=0, description="User's age", example=25)
@@ -44,25 +44,36 @@ class ImageAnalysis(BaseModel):
     existingFurnitureCategories: List[str]
 
 
+class CategoryRecommendation(BaseModel):
+    category: str
+    reasoning: str
+    styleAlignment: str
+    suggestedColorHex: str
+    materialHint: str
+
+
 class RecommendedFilter(BaseModel):
     styles: List[str]
     colorHexRange: List[str]
     colorTone: str
-    categories: "List[CategoryRecommendation]"
+    categories: List[CategoryRecommendation]
     maxProductWidth: float
     maxProductDepth: float
     furnitureDensityHint: str
 
-class CategoryRecommendation(BaseModel):
-    category: str
-    reasoning: str
+
+class AnalysisReasoning(BaseModel):
+    styleJustification: str
+    colorJustification: str
+    densityJustification: str
+    userProfileNote: str
 
 
 
 class GeminiAnalysisResult(BaseModel):
     imageAnalysis: ImageAnalysis
     recommendedFilter: RecommendedFilter
-    reasoning: str
+    reasoning: AnalysisReasoning
 
 
 # ---------- Product (from MongoDB) ----------

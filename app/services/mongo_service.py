@@ -58,6 +58,13 @@ def _min_color_distance(product_colors: List[str], target_colors: List[str]) -> 
     return min(distances)
 
 
+def _normalize_lookup_key(value: str) -> str:
+    """Normalize category/style lookup keys so matching is case- and space-insensitive."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
 # ── Hard filter ──────────────────────────────────────────────────────────────
 
 def _build_mongo_query(analysis: GeminiAnalysisResult) -> dict:
@@ -101,8 +108,12 @@ async def get_recommendations(
     target_colors = rf.colorHexRange
     target_styles_lower = {s.lower() for s in rf.styles}
     
-    # Create a map from category name to reasoning
-    category_reasoning_map = {c.category: c.reasoning for c in rf.categories}
+    # Create a map from normalized category name to reasoning
+    category_reasoning_map = {
+        _normalize_lookup_key(c.category): c.reasoning
+        for c in rf.categories
+        if c.category
+    }
 
     cursor = col.find(query).limit(candidate_limit)
     
@@ -177,11 +188,67 @@ async def get_recommendations(
         ) if dim_raw else None
 
         product_category = doc.get("category", "")
-        reasoning = category_reasoning_map.get(product_category, "Sản phẩm này là một lựa chọn phù hợp.")
+        normalized_category = _normalize_lookup_key(product_category)
+        
+        # Try to get reasoning from category map; if not found, generate dynamic reasoning
+        if normalized_category in category_reasoning_map:
+            reasoning = category_reasoning_map[normalized_category]
+        else:
+            # Fallback: generate reasoning based on matched styles and product category
+            matched_styles = [s for s in rf.styles if s.casefold() in {st.casefold() for st in data["prod_styles"]}]
+            style_hint = matched_styles[0] if matched_styles else (rf.styles[0] if rf.styles else "được chọn")
+            reasoning = f"{product_category} với phong cách {style_hint} phù hợp với không gian của bạn, được chọn vì khớp với bảng màu đề xuất ({', '.join(rf.colorHexRange[:2])}) và kích thước phù hợp."
 
         # Handle image URL
         images_list = doc.get("images", [])
-        image_url = images_list[0] if images_list else None
+
+        # Normalize image entries into a list of URL strings (some docs store dicts)
+        image_candidates: List[str] = []
+        for img in images_list:
+            if isinstance(img, str):
+                image_candidates.append(img)
+            elif isinstance(img, dict):
+                for k in ("url", "imageUrl", "src", "image"):
+                    if k in img and isinstance(img[k], str):
+                        image_candidates.append(img[k])
+                        break
+
+        # Choose the best-matching image by scoring how many tokens from the
+        # product name / category appear in the image URL path. This avoids
+        # picking unrelated images (e.g., lamp image for a bedside table).
+        def _image_score(url: str) -> float:
+            if not url:
+                return 0.0
+            path = url.lower()
+            # tokens from category + product name (skip short words)
+            name_tokens = re.findall(r"\w+", (product_category + " " + doc.get("name", "")).lower())
+            tokens = {t for t in name_tokens if len(t) > 2}
+            score = 0.0
+            for t in tokens:
+                if t in path:
+                    score += 2.0
+
+            # prefer matching suggested styles
+            for s in rf.styles:
+                if isinstance(s, str) and s.lower() in path:
+                    score += 1.0
+
+            # small boost for common image extensions
+            if path.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                score += 0.5
+
+            return score
+
+        image_url = None
+        if image_candidates:
+            # pick the highest scoring image; fall back to first if tie/zero
+            scored = [(img, _image_score(img)) for img in image_candidates]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            best_img, best_score = scored[0]
+            if best_score > 0:
+                image_url = best_img
+            else:
+                image_url = image_candidates[0]
 
         candidates.append(Product(
             id=data["product_id"],

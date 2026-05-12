@@ -71,4 +71,7 @@ Thumbs.db
 secrets/
 
 # Models
-AI/app/models/saved/
+# Do not commit trained model artifacts or index/metadata files
+app/models/saved/*.pkl
+app/models/saved/*.json
+app/models/saved/

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from app.services.behavior_service import load_behavior_matrix
+import app.services.cf_model as cf_model
 from app.services.cf_model import train_model, load_model
 
 router = APIRouter()
@@ -82,7 +83,7 @@ async def trigger_training():
 def model_status():
     """Kiểm tra trạng thái model hiện tại."""
     import os
-    from app.services.cf_model import MODEL_PATH, METADATA_PATH, _model, _user_index, _item_index
+    from app.services.cf_model import MODEL_PATH, METADATA_PATH
 
     meta = None
     try:
@@ -98,9 +99,64 @@ def model_status():
         "training_started_at": _train_started_at,
         "training_finished_at": _train_finished_at,
         "training_error": _train_error,
-        "model_loaded": _model is not None,
+        "model_loaded": cf_model._model is not None,
         "model_file_exists": os.path.exists(MODEL_PATH),
-        "num_users": len(_user_index),
-        "num_items": len(_item_index),
+        "num_users": len(cf_model._user_index),
+        "num_items": len(cf_model._item_index),
         "last_saved_metadata": meta,
+    }
+
+
+@router.post("/reload-model", status_code=200)
+def reload_model_endpoint():
+    """
+    Reload CF model from disk into memory without restarting server.
+    Useful after training completes or if model gets corrupted.
+    """
+    try:
+        success = load_model()
+        return {
+            "success": success,
+            "model_loaded": cf_model._model is not None,
+            "num_users": len(cf_model._user_index),
+            "num_items": len(cf_model._item_index),
+            "message": "Model reloaded successfully" if success else "Failed to load model",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error reloading model: {e}",
+            "error": str(e),
+        }
+
+
+@router.post("/retrain-force")
+async def force_retrain():
+    """
+    Delete old model files and force re-train from scratch.
+    Fixes index/model mismatch issues.
+    """
+    import os
+    from app.services.cf_model import MODEL_PATH, INDEX_PATH, METADATA_PATH
+    
+    # Delete old files
+    for fpath in [MODEL_PATH, INDEX_PATH, METADATA_PATH]:
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+                print(f"[CF] Deleted {fpath}")
+            except Exception as e:
+                return {"success": False, "message": f"Failed to delete {fpath}: {e}"}
+    
+    # Clear globals
+    cf_model._model = None
+    cf_model._user_index = {}
+    cf_model._item_index = {}
+    cf_model._item_index_reverse = {}
+    
+    # Trigger training
+    asyncio.create_task(_run_training_job())
+    return {
+        "status": "accepted",
+        "message": "Old model deleted. Training from scratch queued.",
     }

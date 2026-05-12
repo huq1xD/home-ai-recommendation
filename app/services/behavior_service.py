@@ -32,17 +32,24 @@ async def load_behavior_matrix() -> Tuple[csr_matrix, Dict, Dict]:
     db = client[DB_NAME]
     col = db[BEHAVIOR_COLLECTION]
 
-    # Đọc tất cả events
+    # Đọc tất cả events và normalize id thành string để tránh type-mismatch
     events = []
     async for doc in col.find({}):
-        events.append(doc)
+        # Normalize stored ids to string to match product `_id` stringification elsewhere
+        norm = {
+            "userId": str(doc.get("userId")),
+            "productId": str(doc.get("productId")),
+            "eventType": doc.get("eventType", "PRODUCT_VIEW"),
+            "rating": doc.get("rating") if "rating" in doc else None,
+        }
+        events.append(norm)
 
     if not events:
         return None, {}, {}
 
-    # Tạo index mapping
-    user_ids = list(set(e["userId"] for e in events))
-    product_ids = list(set(e["productId"] for e in events))
+    # Tạo index mapping (string ids)
+    user_ids = list({e["userId"] for e in events})
+    product_ids = list({e["productId"] for e in events})
     user_index = {uid: i for i, uid in enumerate(user_ids)}
     item_index = {pid: i for i, pid in enumerate(product_ids)}
 
@@ -58,6 +65,10 @@ async def load_behavior_matrix() -> Tuple[csr_matrix, Dict, Dict]:
             score = float(e.get("rating", 3))
         else:
             score = EVENT_SCORES.get(event_type, 1.0)
+
+        # Defensive: skip events whose ids are not in the computed indices
+        if uid not in user_index or pid not in item_index:
+            continue
 
         key = (user_index[uid], item_index[pid])
         score_dict[key] = score_dict.get(key, 0) + score

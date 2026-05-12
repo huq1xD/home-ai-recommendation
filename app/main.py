@@ -5,8 +5,8 @@ load_dotenv()
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import recommend, training
-from app.services.cf_model import load_model
+from app.routers import recommend, training, scores
+from app.services.cf_model import load_model, auto_train_on_startup
 from app.services.gemini_service import load_metadata
 
 @asynccontextmanager
@@ -14,6 +14,14 @@ async def lifespan(app: FastAPI):
     # Load the model
     print("Loading CF model...")
     load_model()
+    # Kick off auto-training in background to ensure model is fresh on startup
+    try:
+        import asyncio
+        asyncio.create_task(auto_train_on_startup())
+        print("[CF] Auto-train scheduled in background")
+    except Exception as e:
+        print(f"[CF] Failed to schedule auto-train: {e}")
+
     await load_metadata()
     yield
     # Clean up the model and release the resources
@@ -43,6 +51,7 @@ app.add_middleware(
 
 app.include_router(recommend.router, prefix="/api/v1", tags=["Recommendations"])
 app.include_router(training.router, prefix="/api/v1/admin", tags=["Admin"])
+app.include_router(scores.router, prefix="/api/v1/scores", tags=["Scores"])
 
 
 @app.get("/")

@@ -7,11 +7,17 @@ import json
 import base64
 import httpx
 import asyncio
-from typing import Optional, List
+import time
+import hashlib
+import random
+from typing import Optional, List, Dict, Tuple, Any
 from fastapi import HTTPException
 
 from app.models.schemas import RecommendRequest, GeminiAnalysisResult
 from app.services.mongo_service import get_distinct_categories, get_distinct_styles
+
+
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "90"))
 
 
 def _normalize_gemini_response(data: dict) -> dict:
@@ -28,15 +34,190 @@ def _normalize_gemini_response(data: dict) -> dict:
     return data
 
 
+def _extract_gemini_error_reason(resp: httpx.Response) -> str:
+    """
+    Extract normalized Gemini error reason from response body if present.
+    Example values: RATE_LIMIT_EXCEEDED, RESOURCE_EXHAUSTED.
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return ""
+
+    error_obj = payload.get("error", {})
+    details = error_obj.get("details", [])
+    for item in details:
+        if isinstance(item, dict):
+            # Gemini often returns reason in ErrorInfo payload.
+            reason = item.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip().upper()
+    return ""
+
+
+def _is_daily_quota_exhausted(resp: httpx.Response) -> bool:
+    """
+    Detect non-retryable quota exhaustion from Gemini error payload.
+    """
+    reason = _extract_gemini_error_reason(resp)
+    if reason in {"RESOURCE_EXHAUSTED", "QUOTA_EXCEEDED"}:
+        return True
+
+    body_text = (resp.text or "").upper()
+    return "RESOURCE_EXHAUSTED" in body_text or "QUOTA" in body_text
+
+
+def _extract_json_text(raw_text: str) -> str:
+    """Best-effort extraction of a JSON object from model output."""
+    if not raw_text:
+        return raw_text
+
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start : end + 1]
+    return text
+
+
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
 )
 
+# ── Simple in-memory request cache (prompt_hash -> (timestamp, parsed_json))
+_request_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CACHE_TTL_SECONDS = 60 * 10  # 10 minutes
+
+# Limit concurrent outbound calls to Gemini to avoid bursts
+_gemini_semaphore = asyncio.Semaphore(2)
+
 # ── Metadata Caching ─────────────────────────────────────────────────────────
 
 _cached_categories: List[str] = []
 _cached_styles: List[str] = []
+
+
+def _normalize_catalog_label(value: str) -> str:
+    """Normalize catalog labels for stable prompt generation and matching."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).strip()
+
+
+def _dedupe_normalized_labels(values: List[str]) -> List[str]:
+    """Deduplicate labels while preserving first-seen display form."""
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        normalized = _normalize_catalog_label(value)
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def _pick_fallback_styles(req: RecommendRequest) -> List[str]:
+    styles: List[str] = []
+    requested_style = _normalize_catalog_label(req.style)
+    if requested_style:
+        styles.append(requested_style)
+
+    if _cached_styles:
+        for style in _cached_styles:
+            if style.casefold() != requested_style.casefold():
+                styles.append(style)
+            if len(styles) >= 3:
+                break
+
+    if not styles:
+        styles = ["Modern"]
+
+    return _dedupe_normalized_labels(styles)
+
+
+def _pick_fallback_categories(req: RecommendRequest) -> List[str]:
+    room_type = req.room_type.value if hasattr(req.room_type, "value") else str(req.room_type)
+    room_key = room_type.casefold()
+
+    living_room_defaults = ["Sofa", "Coffee Table", "TV Stand", "Armchair", "Floor Lamp"]
+    bedroom_defaults = ["Bed", "Nightstand", "Wardrobe", "Dresser", "Bedside Lamp"]
+
+    if "living" in room_key:
+        preferred = living_room_defaults
+    elif "bed" in room_key:
+        preferred = bedroom_defaults
+    else:
+        preferred = ["Chair", "Table", "Shelf", "Lamp", "Storage Cabinet"]
+
+    categories: List[str] = []
+    cached_lookup = {category.casefold(): category for category in _cached_categories}
+    for category in preferred:
+        cached_category = cached_lookup.get(category.casefold())
+        categories.append(cached_category or category)
+
+    return _dedupe_normalized_labels(categories)
+
+
+def _build_fallback_analysis(req: RecommendRequest) -> GeminiAnalysisResult:
+    width_cm = round(req.width * 100 * 0.4, 1)
+    depth_cm = round(req.length * 100 * 0.35, 1)
+    fallback_styles = _pick_fallback_styles(req)
+    fallback_categories = _pick_fallback_categories(req)
+    room_type_value = req.room_type.value if hasattr(req.room_type, "value") else str(req.room_type)
+
+    if req.age is not None and req.age <= 25:
+        user_profile_note = "Người dùng trẻ nên ưu tiên bố cục gọn, màu sáng và vật liệu dễ phối để giữ không gian năng động."
+    elif req.age is not None and req.age <= 45:
+        user_profile_note = "Người dùng trưởng thành phù hợp với bố cục cân bằng, màu trung tính và nội thất đa dụng cho sinh hoạt hằng ngày."
+    elif req.age is not None:
+        user_profile_note = "Người dùng lớn tuổi nên ưu tiên sản phẩm dễ sử dụng, màu dịu và công năng rõ ràng để tăng tiện nghi."
+    else:
+        user_profile_note = "Không có thông tin tuổi nên hệ thống ưu tiên lựa chọn an toàn, dễ phối và phù hợp nhiều ngữ cảnh sử dụng."
+
+    return GeminiAnalysisResult(
+        imageAnalysis={
+            "dominantColors": ["#F3F0EA", "#D9D5CF", "#A8A29E"],
+            "colorTone": "neutral warm",
+            "detectedStyle": req.style,
+            "lightingType": "balanced natural light",
+            "existingFurnitureCategories": fallback_categories[:3],
+        },
+        recommendedFilter={
+            "styles": fallback_styles,
+            "colorHexRange": ["#F3F0EA", "#D9D5CF", "#A8A29E", "#6B7280"],
+            "colorTone": "neutral warm",
+            "categories": [
+                {
+                    "category": category,
+                    "reasoning": f"Khi Gemini quá tải, hệ thống ưu tiên {category.lower()} để vẫn bám theo phong cách {req.style} và bố cục của {room_type_value}.",
+                    "styleAlignment": f"Giữ tinh thần {req.style}",
+                    "suggestedColorHex": "#D9D5CF",
+                    "materialHint": "gỗ sáng / vải trung tính",
+                }
+                for category in fallback_categories
+            ],
+            "maxProductWidth": width_cm,
+            "maxProductDepth": depth_cm,
+            "furnitureDensityHint": req.furniture_density.value,
+        },
+        reasoning={
+            "styleJustification": f"Fallback sử dụng style '{req.style}' làm neo chính để giữ đúng ý định ban đầu của user, dù Gemini không phản hồi kịp.",
+            "colorJustification": "Bảng màu trung tính sáng giúp query MongoDB vẫn có tín hiệu ổn định khi thiếu phân tích ảnh.",
+            "densityJustification": f"Giới hạn kích thước được suy từ kích thước phòng và mật độ '{req.furniture_density.value}' để tránh đề xuất đồ quá lớn.",
+            "userProfileNote": user_profile_note,
+        },
+    )
 
 async def load_metadata():
     """
@@ -50,7 +231,7 @@ async def load_metadata():
         # Load categories
         categories = await get_distinct_categories()
         if categories:
-            _cached_categories = categories
+            _cached_categories = _dedupe_normalized_labels(categories)
             print(f"[Metadata] Loaded {len(_cached_categories)} categories.")
         else:
             print("[Metadata] Warning: No categories found in DB, using empty list.")
@@ -61,8 +242,8 @@ async def load_metadata():
             print(f"[Metadata] Found {len(styles_from_db)} styles in DB.")
             
             # Merge and remove duplicates, then sort
-            combined_styles = sorted(list(set(_cached_styles + styles_from_db)))
-            _cached_styles = combined_styles
+            combined_styles = _dedupe_normalized_labels(_cached_styles + styles_from_db)
+            _cached_styles = sorted(combined_styles)
         
         print(f"[Metadata] Final style list has {len(_cached_styles)} unique styles.")
 
@@ -93,57 +274,88 @@ User gender: {gender}"""
     available_styles = ", ".join(f'"{s}"' for s in _cached_styles)
     available_categories = ", ".join(f'"{c}"' for c in _cached_categories)
 
-    return f"""You are an interior design AI assistant.
-Return ONLY a valid JSON object, no explanation, no markdown, no code fences.
+    return f"""You are an expert interior design AI assistant specializing in Vietnamese home decor.
+Return ONLY a valid JSON object. No explanation, no markdown, no code fences.
 
-USER INPUT:
+## USER CONTEXT
 {user_input}
 
-Return this exact JSON structure:
+## TASK
+Analyze the room context and user profile, then recommend the most suitable furniture categories with detailed reasoning.
+
+## OUTPUT SCHEMA
 {{
   "imageAnalysis": {{
     "dominantColors": ["#hex1", "#hex2", "#hex3"],
-    "colorTone": "warm",
-    "detectedStyle": "modern",
-    "lightingType": "natural",
+    "colorTone": "warm|cool|neutral",
+    "detectedStyle": "detected style name",
+    "lightingType": "natural|artificial|mixed",
     "existingFurnitureCategories": []
   }},
   "recommendedFilter": {{
-    "styles": ["Modern"],
+    "styles": ["Style1"],
     "colorHexRange": ["#hex1", "#hex2"],
-    "colorTone": "warm",
+    "colorTone": "warm|cool|neutral",
     "categories": [
-        {{ "category": "Sofa", "reasoning": "A sofa is essential for a living room."}},
-        {{ "category": "Bàn", "reasoning": "A coffee table complements the sofa."}},
-        {{ "category": "Ghế", "reasoning": "An armchair provides extra seating."}}
+      {{
+        "category": "Sofa",
+        "reasoning": "Sofa dạng modular phù hợp với phong cách Modern vì đường nét gọn gàng, không rườm rà. Tông màu xám trung tính (#6B7280) hoặc navy sẽ ăn khớp với bảng màu cool tone, đồng thời phù hợp với nam giới 26-45 tuổi ưa sự tối giản.",
+        "styleAlignment": "Modern",
+        "suggestedColorHex": "#6B7280",
+        "materialHint": "vải chenille hoặc da tổng hợp"
+      }}
     ],
     "maxProductWidth": {max_w},
     "maxProductDepth": {max_d},
     "furnitureDensityHint": "{furniture_density}"
   }},
-  "reasoning": "One sentence here"
+  "reasoning": {{
+    "styleJustification": "Lý do chọn style dựa trên thông tin phòng và sở thích user",
+    "colorJustification": "Lý do chọn bảng màu dựa trên ánh sáng tự nhiên và kích thước phòng",
+    "densityJustification": "Lý do số lượng nội thất phù hợp với diện tích {req.width}x{req.length}m",
+    "userProfileNote": "Ghi chú cá nhân hóa theo tuổi/giới tính nếu có thông tin"
+  }}
 }}
 
-RULES:
-- room_type must be one of: "Living Room", "Bedroom".
-- styles must be from this dynamic list: [{available_styles}]
-- categories must be from this dynamic list of Vietnamese names: [{available_categories}]
-- colorTone must be one of: warm, cool, neutral
-- lightingType must be one of: natural, artificial, mixed
-- furnitureDensityHint must be one of: sparse, medium, dense
-- Based on 'furnitureDensity', adjust the number of 'categories' recommended:
-  - "sparse": Recommend 2-3 essential furniture categories.
-  - "medium": Recommend 4-6 core furniture categories.
-  - "dense": Recommend 7-10 furniture categories, including accessories and decor items.
-- maxProductWidth = {max_w}
-- maxProductDepth = {max_d}
-- Each category in the list must have a brief 'reasoning' in Vietnamese.
-- If 'User age' is provided, tailor recommendations:
-  - Ages 10-25: Prefer vibrant, trendy styles (e.g., Bohemian, Modern, Tropical Modern) and brighter, more saturated color palettes.
-  - Ages 26-45: Offer a balanced mix of contemporary and timeless styles (e.g., Scandinavian, Mid-Century, Japandi) with versatile color schemes.
-  - Ages 46+: Suggest classic, comfortable, and elegant styles (e.g., Classic, Rustic, Haussmannian) with more neutral or muted color palettes and accessible furniture (e.g., lower beds, supportive chairs).
-- Return ONLY the JSON, nothing else
-"""
+## STRICT RULES
+
+### Schema constraints
+- styles: chỉ dùng từ danh sách: [{available_styles}]
+- categories[].category: chỉ dùng từ danh sách: [{available_categories}]
+- colorTone: "warm" | "cool" | "neutral"
+- lightingType: "natural" | "artificial" | "mixed"
+- furnitureDensityHint: "sparse" | "medium" | "dense"
+- styleAlignment: phải khớp với một style trong recommendedFilter.styles
+- suggestedColorHex: phải nằm trong palette colorHexRange
+
+### Furniture density
+- "sparse" → 2-3 danh mục thiết yếu
+- "medium" → 4-6 danh mục cốt lõi
+- "dense" → 7-10 danh mục bao gồm phụ kiện trang trí
+
+### Dimension constraints
+- maxProductWidth = {max_w} cm
+- maxProductDepth = {max_d} cm
+
+### Reasoning quality (MANDATORY — minimum 2 sentences per category)
+1. Tại sao item này phù hợp với style đã chọn, phải nhắc ít nhất 1 đặc điểm thiết kế cụ thể của chính category đó.
+2. Màu sắc/chất liệu nào phù hợp với colorHexRange và tại sao, phải nêu 1 màu hoặc 1 chất liệu rõ ràng.
+3. Liên hệ với tuổi/giới tính user nếu có thông tin, gắn trực tiếp vào công năng của item.
+4. Không được dùng câu rập khuôn như "Sản phẩm này là một lựa chọn phù hợp." hoặc câu tương đương chung chung.
+
+### Category reasoning quality
+- Mỗi category phải có reasoning riêng, không được lặp lại nguyên văn giữa các category.
+- Ưu tiên nhắc đến chi tiết thật của category: sofa/giường/tủ/kệ/bàn/ghế/đèn/thảm/cây trang trí.
+- Nếu category có tên trong danh sách DB nhưng khác nhau chỉ bởi khoảng trắng hoặc hoa thường, hãy xem là cùng một category.
+- Nếu category là nhóm rộng như "Đồ nội thất" hoặc "Hàng trang trí", hãy mô tả theo chức năng cụ thể của item thay vì câu mô tả mơ hồ.
+
+### Age-based personalization
+- 10-25 tuổi: style năng động (Bohemian, Modern, Tropical Modern), màu sắc tươi sáng, bão hòa cao
+- 26-45 tuổi: style cân bằng (Scandinavian, Mid-Century, Japandi), màu trung tính linh hoạt
+- 46+ tuổi: style cổ điển (Classic, Rustic, Haussmannian), màu trung tính/nhạt, nội thất tiện dụng
+
+Return ONLY the JSON object, nothing else."""
+
 
 
 async def analyze_room(
@@ -175,7 +387,8 @@ async def analyze_room(
         "contents": [{"parts": parts}],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 4096,
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
         },
     }
 
@@ -184,51 +397,95 @@ async def analyze_room(
     if image_bytes:
         print(f"[Gemini] Image included, size: {len(image_bytes)} bytes")
 
-    for attempt in range(3):
+    # Compute a cache key for this request to avoid duplicate calls in quick succession
+    hasher = hashlib.sha256()
+    hasher.update(prompt_text.encode("utf-8"))
+    if image_bytes:
+        hasher.update(image_bytes)
+    cache_key = hasher.hexdigest()
+
+    # Return cached result if fresh
+    cached = _request_cache.get(cache_key)
+    if cached:
+        ts, parsed_json = cached
+        if time.time() - ts < _CACHE_TTL_SECONDS:
+            print("[Gemini] Returning cached analysis result.")
+            return GeminiAnalysisResult(**parsed_json)
+        else:
+            # expired
+            del _request_cache[cache_key]
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                    json=payload,
+            # throttle concurrency to avoid bursts
+            async with _gemini_semaphore:
+                timeout = httpx.Timeout(
+                    connect=10.0,
+                    read=GEMINI_TIMEOUT_SECONDS,
+                    write=GEMINI_TIMEOUT_SECONDS,
+                    pool=10.0,
                 )
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                        json=payload,
+                    )
 
-                if resp.status_code == 429:
-                    # Exponential backoff: 1s, 2s, 4s (total 7s instead of 60s)
-                    wait = 2 ** attempt
-                    print(f"[Gemini] Rate limited (attempt {attempt + 1}/3), waiting {wait}s...")
-                    await asyncio.sleep(wait)
-                    continue
+            status = getattr(resp, "status_code", None)
+            if status == 429 or status == 503:
+                if status == 429 and _is_daily_quota_exhausted(resp):
+                    print("[Gemini] Daily quota exhausted (RPD). Skipping retries.")
+                    return _build_fallback_analysis(req)
 
-                if resp.status_code == 400:
-                    error_detail = resp.text[:300] if resp.text else "Bad Request"
-                    print(f"[Gemini] HTTP 400 error: {error_detail}")
-                    raise HTTPException(status_code=400, detail=f"Invalid Gemini request: {error_detail[:100]}")
+                # Exponential backoff with jitter
+                if attempt == max_attempts - 1:
+                    print("[Gemini] Final retry exhausted. Returning fallback analysis.")
+                    return _build_fallback_analysis(req)
 
-                resp.raise_for_status()
-                data = resp.json()
+                wait = min(15, (2 ** attempt)) + random.uniform(0, 1)
+                print(f"[Gemini] Upstream rate/availability issue (status={status}) attempt {attempt + 1}/{max_attempts}, waiting {wait:.1f}s...")
+                await asyncio.sleep(wait)
+                continue
+
+            if status == 400:
+                error_detail = resp.text[:300] if resp.text else "Bad Request"
+                print(f"[Gemini] HTTP 400 error: {error_detail}")
+                raise HTTPException(status_code=400, detail=f"Invalid Gemini request: {error_detail[:100]}")
+
+            resp.raise_for_status()
+            data = resp.json()
 
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
             print(f"[Gemini] Raw response: {raw_text[:200]}")
 
             # Clean JSON
-            clean = raw_text.strip()
-            if clean.startswith("```"):
-                clean = clean.split("```")[1]
-                if clean.startswith("json"):
-                    clean = clean[4:]
-            clean = clean.strip()
+            clean = _extract_json_text(raw_text)
 
             parsed = json.loads(clean)
             parsed = _normalize_gemini_response(parsed)
+
+            # Cache parsed result
+            _request_cache[cache_key] = (time.time(), parsed)
+
             print(f"[Gemini] Success on attempt {attempt + 1}")
             return GeminiAnalysisResult(**parsed)
 
+        except httpx.HTTPStatusError as http_exc:
+            print(f"[Gemini] HTTP status error attempt {attempt + 1}: {http_exc}")
+            if attempt == max_attempts - 1:
+                print("[Gemini] All retries failed. Returning fallback analysis.")
+                return _build_fallback_analysis(req)
+            await asyncio.sleep(min(15, 2 ** attempt))
+
         except Exception as exc:
             print(f"[Gemini] Error attempt {attempt + 1}: {exc}")
-            if attempt == 2:
-                print("[Gemini] All retries failed.")
-                raise HTTPException(status_code=503, detail="AI analysis service failed after multiple retries.")
-            await asyncio.sleep(5)
+            if attempt == max_attempts - 1:
+                print("[Gemini] All retries failed. Returning fallback analysis.")
+                return _build_fallback_analysis(req)
+            # backoff with jitter for non-http errors
+            wait = min(15, 2 ** attempt) + random.uniform(0, 1)
+            await asyncio.sleep(wait)
 
     # This part should ideally not be reached if the loop logic is correct.
-    raise HTTPException(status_code=500, detail="An unexpected error occurred in the AI analysis service.")
+    return _build_fallback_analysis(req)
