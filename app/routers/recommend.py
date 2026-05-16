@@ -74,7 +74,8 @@ async def recommend_furniture(
         )
 
     # If room visibility is too limited, block and ask for a wider shot
-    if getattr(analysis, "roomVisibility", None) == "MINIMAL":
+    room_visibility = getattr(analysis, "roomVisibility", None)
+    if room_visibility in ("MINIMAL", "PARTIAL"):
         raise HTTPException(status_code=422, detail={
             "error": "INSUFFICIENT_ROOM_VIEW",
             "message": "Góc chụp quá hẹp, không đủ thông tin để gợi ý sản phẩm.",
